@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	v1 "k8s.io/api/core/v1"
+	"log"
+	"strings"
 
 	"github.com/volcengine/volcengine-go-sdk/service/natgateway"
 	"github.com/volcengine/volcengine-go-sdk/volcengine"
@@ -48,7 +50,7 @@ func main() {
 		if !ok {
 			continue
 		}
-		_, ok = ann["adjust-snat-controller.alphagodzilla/eip"]
+		_, ok = ann["adjust-snat-controller.alphagodzilla/eip-id"]
 		if !ok {
 			continue
 		}
@@ -60,29 +62,39 @@ func main() {
 			entry = append(entry, &pod)
 		}
 	}
+	// 创建VE的客户端
+	veClient := create_client("", "", "")
 	for ngi, tpods := range natGatewayIdMap {
-		snat_map := list_nat_snat_config("", "", "ap-southeast-1", ngi)
-		if len(*snat_map) <= 0 {
+		snatMap := list_nat_snat_config(veClient, ngi)
+		if len(*snatMap) <= 0 {
 			continue
 		}
 		for _, pod := range tpods {
 			podIp := pod.Status.PodIP
-			// current eip
-			currentEip, ok := (*snat_map)[fmt.Sprintf("%s/32", podIp)]
+			// expect pod bind eip
+			ann := pod.Annotations
+			expectEipId, _ := ann["adjust-snat-controller.alphagodzilla/eip-id"]
+
+			sourceCidr, ok := (*snatMap)[expectEipId]
 			if !ok {
+				// 没有相对应的SNAT规则，就创建新的规则
+				subNetId := ann["adjust-snat-controller.alphagodzilla/sub-net-id"]
+				snatName := ann["adjust-snat-controller.alphagodzilla/name"]
+				create_snat(veClient, ngi, expectEipId, subNetId, snatName, fmt.Sprintf("%v/32", podIp))
 				continue
 			}
-			// expect eip
-			ann := pod.Annotations
-			expectEip, _ := ann["adjust-snat-controller.alphagodzilla/eip"]
-			if *currentEip != expectEip {
-				// IP不一致，说明Pod发生漂移
+			if !strings.HasPrefix(*sourceCidr, podIp) {
+				// 不一致，说明Pod发生漂移. 修改SNAT规则
+				log.Printf("Pod发生漂移IP变化，预期IP=%v， 当前IP=%v， 动作：修改SNAT规则\n", *sourceCidr, podIp)
+				// 删除旧的SNAT规则
+				delete_snat(veClient)
+				// 创建新的SNAT规则
 			}
 		}
 	}
 }
 
-func list_nat_snat_config(ak string, sk string, region string, natGatewayId string) *map[string]*string {
+func create_client(ak string, sk string, region string) *natgateway.NATGATEWAY {
 	config := volcengine.NewConfig().
 		WithRegion(region).
 		WithCredentials(credentials.NewStaticCredentials(ak, sk, ""))
@@ -90,12 +102,14 @@ func list_nat_snat_config(ak string, sk string, region string, natGatewayId stri
 	if err != nil {
 		panic(err)
 	}
-	svc := natgateway.New(sess)
+	return natgateway.New(sess)
+}
 
+func list_nat_snat_config(client *natgateway.NATGATEWAY, natGatewayId string) *map[string]*string {
 	describeNatGatewaysInput := &natgateway.DescribeNatGatewaysInput{
 		NatGatewayIds: volcengine.StringSlice([]string{natGatewayId}),
 	}
-	resp, err := svc.DescribeNatGateways(describeNatGatewaysInput)
+	resp, err := client.DescribeNatGateways(describeNatGatewaysInput)
 	if err != nil {
 		panic(err)
 	}
@@ -114,19 +128,47 @@ func list_nat_snat_config(ak string, sk string, region string, natGatewayId stri
 			NatGatewayId: natEntry.NatGatewayId,
 			SnatEntryIds: snatIds,
 		}
-		snatResp, err := svc.DescribeSnatEntries(describeSnatEntriesInput)
+		snatResp, err := client.DescribeSnatEntries(describeSnatEntriesInput)
 		if err != nil {
 			panic(err)
 		}
 		for _, snatEntry := range snatResp.SnatEntries {
 			sourceCidr := snatEntry.SourceCidr
-			eipAddress := snatEntry.EipAddress
+			eipId := snatEntry.EipId
 			//snat_entries = append(snat_entries, map[string]*string{
 			//	"sourceCidr": sourceCidr,
 			//	"eipAddress": eipAddress,
 			//})
-			snat_map[*sourceCidr] = eipAddress
+			snatEntry := snatEntry.SnatEntryId
+			snat_map[*eipId] = sourceCidr
 		}
 	}
 	return &snat_map
+}
+
+func delete_snat(client *natgateway.NATGATEWAY, snatId string) {
+	deleteSnatEntryInput := &natgateway.DeleteSnatEntryInput{
+		SnatEntryId: volcengine.String(snatId),
+	}
+
+	resp, err := client.DeleteSnatEntry(deleteSnatEntryInput)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("删除SNAT规则，%v, %v\n", snatId, resp)
+}
+
+func create_snat(client *natgateway.NATGATEWAY, NatGatewayId string, EipId string, SubnetId string, SnatEntryName string, SourceCidr string) {
+	createSnatEntryInput := &natgateway.CreateSnatEntryInput{
+		EipId:         volcengine.String(EipId),
+		NatGatewayId:  volcengine.String(NatGatewayId),
+		SnatEntryName: volcengine.String(SnatEntryName),
+		SubnetId:      volcengine.String(SubnetId),
+		SourceCidr:    volcengine.String(SourceCidr),
+	}
+	resp, err := client.CreateSnatEntry(createSnatEntryInput)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("创建SNAT规则，%v\n", resp)
 }
