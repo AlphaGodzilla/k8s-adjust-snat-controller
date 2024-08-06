@@ -2,99 +2,160 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	v1 "k8s.io/api/core/v1"
-	"log"
-	"strings"
-
 	"github.com/volcengine/volcengine-go-sdk/service/natgateway"
 	"github.com/volcengine/volcengine-go-sdk/volcengine"
 	"github.com/volcengine/volcengine-go-sdk/volcengine/credentials"
 	"github.com/volcengine/volcengine-go-sdk/volcengine/session"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 
 const (
-	AK = "AK"
-	SK = "SK"
+	AK                 = "AK"
+	SK                 = "SK"
+	REGION             = "REGION"
+	LABLE_ENABLE       = "adjust-snat-controller.alphagodzilla/enable"
+	ANNO_NATGATEWAY_ID = "adjust-snat-controller.alphagodzilla/nat-gateway-id"
+	ANNO_EIP           = "adjust-snat-controller.alphagodzilla/eip-id"
 )
 
+func getEnv(key string, defaultVal string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		if defaultVal != "" {
+			return defaultVal
+		}
+		panic(fmt.Sprintf("环境变量 %v 为空", key))
+	}
+	return value
+}
+
 func main() {
-	// 目标：获取pod上面的注解
+	//var config *rest.Config
+	var kubeconfig *string
+	if home := homedir.HomeDir(); home != "" {
+		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+	} else {
+		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	}
+	flag.Parse()
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		panic(err.Error())
+		// 使用 KubeConfig 文件创建集群配置
+		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
+		if err != nil {
+			panic(err.Error())
+		}
 	}
-	clientset, err := kubernetes.NewForConfig(config)
+	// 目标：获取pod上面的注解
+	clientSet, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
-	// labels.NewRequirement("adjust-snat-controller.alphagodzilla/", op selection.Operator, vals []string, opts ...field.PathOption)
-	// fields.EscapeValue(s string)
-	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("metadata.annotations[%s]=[%s]", "adjust-snat-controller.alphagodzilla/enable", "true"),
+	pods, err := clientSet.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+		LabelSelector: LABLE_ENABLE + "=true",
 	})
+	if err != nil {
+		panic(err.Error())
+	} else {
+		//fmt.Printf("匹配的Pod列表; %v\n", pods)
+	}
+	fmt.Printf("匹配到pod数量: %v\n", len(pods.Items))
 	if len(pods.Items) <= 0 {
 		return
 	}
-	natGatewayIdMap := make(map[string][]*v1.Pod, 0)
+	natGatewayIdMap := make(map[string][]*v1.Pod)
+	// 对Pod进行排序
+	sort.Slice(pods.Items, func(i, j int) bool {
+		return pods.Items[i].Name < pods.Items[j].Name
+	})
 	for _, pod := range pods.Items {
+		labels := pod.Labels
+		_, ok := labels[LABLE_ENABLE]
+		if !ok {
+			continue
+		}
 		ann := pod.Annotations
-		_, ok := ann["adjust-snat-controller.alphagodzilla/enable"]
+		ngi, ok := ann[ANNO_NATGATEWAY_ID]
 		if !ok {
 			continue
 		}
-		ngi, ok := ann["adjust-snat-controller.alphagodzilla/nat-gateway-id"]
+		eip, ok := ann[ANNO_EIP]
 		if !ok {
 			continue
 		}
-		_, ok = ann["adjust-snat-controller.alphagodzilla/eip-id"]
-		if !ok {
-			continue
-		}
+		fmt.Printf("POD: %v, ngi=%v, eip=%v\n", pod.Name, ngi, eip)
 		entry, ok := natGatewayIdMap[ngi]
 		if !ok {
 			natGatewayIdMap[ngi] = make([]*v1.Pod, 0)
 			natGatewayIdMap[ngi] = append(natGatewayIdMap[ngi], &pod)
 		} else {
-			entry = append(entry, &pod)
+			natGatewayIdMap[ngi] = append(entry, &pod)
 		}
 	}
+	//fmt.Printf("NAT-POD列表: %v\n", natGatewayIdMap)
 	// 创建VE的客户端
-	veClient := create_client("", "", "")
+	veClient := createClient(getEnv(AK, ""), getEnv(SK, ""), getEnv(REGION, "ap-southeast-1"))
 	for ngi, tpods := range natGatewayIdMap {
-		snatMap := list_nat_snat_config(veClient, ngi)
+		snatMap := listNatSnatConfig(veClient, ngi)
 		if len(*snatMap) <= 0 {
 			continue
 		}
-		for _, pod := range tpods {
-			podIp := pod.Status.PodIP
+		for index, pod := range tpods {
 			// expect pod bind eip
 			ann := pod.Annotations
-			expectEipId, _ := ann["adjust-snat-controller.alphagodzilla/eip-id"]
-
-			sourceCidr, ok := (*snatMap)[expectEipId]
-			if !ok {
-				// 没有相对应的SNAT规则，就创建新的规则
-				subNetId := ann["adjust-snat-controller.alphagodzilla/sub-net-id"]
-				snatName := ann["adjust-snat-controller.alphagodzilla/name"]
-				create_snat(veClient, ngi, expectEipId, subNetId, snatName, fmt.Sprintf("%v/32", podIp))
+			eipIds, _ := ann[ANNO_EIP]
+			eipParts := strings.Split(eipIds, ",")
+			eipPartMaxIndex := len(eipParts) - 1
+			if index > eipPartMaxIndex {
 				continue
 			}
-			if !strings.HasPrefix(*sourceCidr, podIp) {
-				// 不一致，说明Pod发生漂移. 修改SNAT规则
-				log.Printf("Pod发生漂移IP变化，预期IP=%v， 当前IP=%v， 动作：修改SNAT规则\n", *sourceCidr, podIp)
-				// 删除旧的SNAT规则
-				delete_snat(veClient)
-				// 创建新的SNAT规则
+			eipId := eipParts[index]
+			fmt.Printf("生成执行计划, pod=%v, eip=%v\n", pod.Name, eipId)
+			if eipId == "" {
+				continue
 			}
+			snatItem, ok := (*snatMap)[eipId]
+			podIp := pod.Status.PodIP
+			if !ok {
+				// 没有相对应的SNAT规则，就创建新的规则
+				snatName := pod.Name
+				fmt.Printf("计划: 创建SNAT规则, snatName=%v, sourceCidr=%v/32\n", snatName, podIp)
+				createSnat(veClient, ngi, eipId, snatName, fmt.Sprintf("%v/32", podIp))
+				continue
+			}
+			sourceCidr := snatItem["sourceCidr"]
+			if !strings.HasPrefix(sourceCidr, podIp) {
+				// 不一致，说明Pod发生漂移. 修改SNAT规则
+				log.Printf("Pod发生漂移IP变化，预期IP=%v， 当前IP=%v， 动作：修改SNAT规则\n", sourceCidr, podIp)
+				// 删除旧的SNAT规则
+				snatId := snatItem["snatId"]
+				fmt.Printf("计划: 删除SNAT规则,snatId=%v, 然后创建新SNAT规则\n", snatId)
+				deleteSnat(veClient, snatId)
+				// 创建新的SNAT规则
+				snatName := pod.Name
+				fmt.Printf("计划: 创建SNAT规则, snatName=%v, sourceCidr=%v/32\n", snatName, podIp)
+				createSnat(veClient, ngi, eipId, snatName, fmt.Sprintf("%v/32", podIp))
+				continue
+			}
+			fmt.Printf("已全部最新，无需修改\n")
 		}
 	}
 }
 
-func create_client(ak string, sk string, region string) *natgateway.NATGATEWAY {
+func createClient(ak string, sk string, region string) *natgateway.NATGATEWAY {
 	config := volcengine.NewConfig().
 		WithRegion(region).
 		WithCredentials(credentials.NewStaticCredentials(ak, sk, ""))
@@ -105,7 +166,7 @@ func create_client(ak string, sk string, region string) *natgateway.NATGATEWAY {
 	return natgateway.New(sess)
 }
 
-func list_nat_snat_config(client *natgateway.NATGATEWAY, natGatewayId string) *map[string]*string {
+func listNatSnatConfig(client *natgateway.NATGATEWAY, natGatewayId string) *map[string]map[string]string {
 	describeNatGatewaysInput := &natgateway.DescribeNatGatewaysInput{
 		NatGatewayIds: volcengine.StringSlice([]string{natGatewayId}),
 	}
@@ -114,7 +175,7 @@ func list_nat_snat_config(client *natgateway.NATGATEWAY, natGatewayId string) *m
 		panic(err)
 	}
 	// fmt.Println(resp)
-	snat_map := make(map[string]*string, 0)
+	snatMap := make(map[string]map[string]string)
 	for _, natEntry := range resp.NatGateways {
 		snatIds := make([]*string, 0)
 		for _, snatEntryId := range natEntry.SnatEntryIds {
@@ -135,18 +196,17 @@ func list_nat_snat_config(client *natgateway.NATGATEWAY, natGatewayId string) *m
 		for _, snatEntry := range snatResp.SnatEntries {
 			sourceCidr := snatEntry.SourceCidr
 			eipId := snatEntry.EipId
-			//snat_entries = append(snat_entries, map[string]*string{
-			//	"sourceCidr": sourceCidr,
-			//	"eipAddress": eipAddress,
-			//})
 			snatEntry := snatEntry.SnatEntryId
-			snat_map[*eipId] = sourceCidr
+			item := make(map[string]string)
+			item["snatId"] = *snatEntry
+			item["sourceCidr"] = *sourceCidr
+			snatMap[*eipId] = item
 		}
 	}
-	return &snat_map
+	return &snatMap
 }
 
-func delete_snat(client *natgateway.NATGATEWAY, snatId string) {
+func deleteSnat(client *natgateway.NATGATEWAY, snatId string) {
 	deleteSnatEntryInput := &natgateway.DeleteSnatEntryInput{
 		SnatEntryId: volcengine.String(snatId),
 	}
@@ -155,20 +215,27 @@ func delete_snat(client *natgateway.NATGATEWAY, snatId string) {
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("删除SNAT规则，%v, %v\n", snatId, resp)
+	log.Printf("删除SNAT规则，%v, %v\n", snatId, toJsonStr(resp))
 }
 
-func create_snat(client *natgateway.NATGATEWAY, NatGatewayId string, EipId string, SubnetId string, SnatEntryName string, SourceCidr string) {
+func createSnat(client *natgateway.NATGATEWAY, NatGatewayId string, EipId string, SnatEntryName string, SourceCidr string) {
 	createSnatEntryInput := &natgateway.CreateSnatEntryInput{
 		EipId:         volcengine.String(EipId),
 		NatGatewayId:  volcengine.String(NatGatewayId),
 		SnatEntryName: volcengine.String(SnatEntryName),
-		SubnetId:      volcengine.String(SubnetId),
 		SourceCidr:    volcengine.String(SourceCidr),
 	}
 	resp, err := client.CreateSnatEntry(createSnatEntryInput)
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("创建SNAT规则，%v\n", resp)
+	log.Printf("创建SNAT规则，%v\n", toJsonStr(resp))
+}
+
+func toJsonStr(value any) string {
+	json, err := json.Marshal(value)
+	if err != nil {
+		fmt.Println("Error serializing to JSON:", err)
+	}
+	return string(json)
 }
