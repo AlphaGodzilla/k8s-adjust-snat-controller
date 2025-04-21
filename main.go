@@ -118,11 +118,7 @@ func main() {
 			ann := pod.Annotations
 			eipIds, _ := ann[ANNO_EIP]
 			eipParts := strings.Split(eipIds, ",")
-			eipPartMaxIndex := len(eipParts) - 1
-			if index > eipPartMaxIndex {
-				continue
-			}
-			eipId := eipParts[index]
+			eipId := eipParts[index%len(eipParts)]
 			fmt.Printf("生成执行计划, pod=%v, eip=%v\n", pod.Name, eipId)
 			if eipId == "" {
 				continue
